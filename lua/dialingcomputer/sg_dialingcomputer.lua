@@ -1,5 +1,7 @@
 //Lua Dialing Computer
 
+AddCSLuaFile("dialingcomputer/sg_dialingcomputer.lua")
+
 local ENT = {}
 
 ENT.Type = "anim"
@@ -19,10 +21,51 @@ function ENT:SetupDataTables()
 	self:NetworkVar("Bool",3,"Fast")
 	self:NetworkVar("Bool",4,"Active")
 	self:NetworkVar("Bool",5,"KeyboardActive")
+	self:NetworkVar("Bool",6,"IrisClosed")
 end
 
 if SERVER then
+
+	function ENT:ClosestGate(tbl,pos,filter)
+		if isentity(pos) then pos=pos:LocalToWorld(pos:OBBCenter()) end
+		local dist,near=999999
+		for k,v in next,tbl do
+			local d = v:GetPos():DistToSqr(pos)
+			if d<dist then
+				dist=d
+				near=v
+			end
+		end
+		return near,math.sqrt(dist)
+	end
+
+	function ENT:SpawnFunction( ply, tr, ClassName )
+
+		if ( !tr.Hit ) then return end
+
+		local SpawnPos = tr.HitPos + tr.HitNormal - Vector(0,0,0.5)
+		local SpawnAng = ply:EyeAngles()
+		SpawnAng.p = 0
+		SpawnAng.y = SpawnAng.y + 180
+
+		local ent = ents.Create( ClassName )
+		ent:SetCreator( ply )
+		ent:SetPos( SpawnPos )
+		ent:SetAngles( SpawnAng )
+		ent:Spawn()
+		ent:Activate()
+
+		ent:DropToFloor()
+
+		return ent
+
+	end
+
 	function ENT:Initialize()
+		if self.keyboard then
+			self.keyboard:Remove()
+			self.keyboard = nil
+		end
 		self:SetModel("models/props/cs_office/computer_monitor.mdl")
 		self:PhysicsInit(SOLID_VPHYSICS)
 		self:SetMoveType(MOVETYPE_VPHYSICS)
@@ -32,66 +75,118 @@ if SERVER then
 		if (phys:IsValid()) then
 			phys:Wake()
 		end
-		util.AddNetworkString("AddressRequest"..self:EntIndex())
-		util.AddNetworkString("ComenceDial"..self:EntIndex())
-		util.AddNetworkString("ChangeAddress"..self:EntIndex())
-		util.AddNetworkString("ClearAddress"..self:EntIndex())
+		phys:EnableMotion(false)
+		util.AddNetworkString("dc_AddressRequest"..self:EntIndex())
+		util.AddNetworkString("dc_ComenceDial"..self:EntIndex())
+		util.AddNetworkString("dc_ChangeAddress"..self:EntIndex())
+		util.AddNetworkString("dc_ClearAddress"..self:EntIndex())
+		util.AddNetworkString("dc_NewGate"..self:EntIndex())
+		util.AddNetworkString("dc_DisconnectGate"..self:EntIndex())
+		util.AddNetworkString("dc_ToggleIris"..self:EntIndex())
+		util.AddNetworkString("dc_AddHistory"..self:EntIndex())
 		self.locking = false
 		self.lastsymbol = ""
 		self:FindNewGate()
-		//print("initalized")
+
+		self.keyboard = ents.Create("win7_dialingcomp_keyboard")
+		self.keyboard:SetPos(self:LocalToWorld(Vector(13,0,0)))
+		self.keyboard:SetAngles(self:GetAngles())
+		self.keyboard:Spawn()
+		self.keyboard:SetDPC(self)
+		self.keyboard.dpc = self
+		self.keyboard:SetCreator(self:GetCreator())
+		self.keyboard:GetPhysicsObject():EnableMotion(false)
+		self.GateTries = 0
 	end
 
 	function ENT:FindNewGate()
-		local candidates = ents.FindByClass("stargate_*")
-		for k,v in pairs(candidates) do
-			if v:GetClass() == "stargate_iris" or v:GetClass() == "stargate_tollan" then
-				table.remove(candidates,k)
+		local candidates = {}
+		for k,v in pairs(ents.FindByClass("stargate_*")) do
+			if v.IsStargate then
+				if v:GetClass() == "stargate_orlin" or v:GetClass() == "stargate_tollan" or v:GetClass() == "stargate_iris" or v:GetClass() == "stargate_supergate" then
+					continue
+				else
+					table.insert(candidates,v)
+				end
 			end
 		end
-		self.stargate = ents.closest(candidates,self)
-		self:SetStargate(self.stargate)
+		local chosen = self:ClosestGate(candidates,self)
+		if chosen == nil then
+			self:SetStargate(chosen)
+		else
+			self.stargate = chosen
+			self:SetStargate(self.stargate)
+		end
 	end
 
 	function ENT:Use(ply)
-		if self.stargate.Dialling then
-			self:EmitSound("buttons/combine_button2.wav")
-			self.stargate:AbortDialling()
-			return
-		elseif self.stargate.IsOpen then
-			self:EmitSound("buttons/combine_button2.wav")
-			self.stargate:Disconnect()
-		else
-			net.Start("AddressRequest"..self:EntIndex())
-			net.Send(ply)
+		if not IsValid(self.stargate) then return end
+		local addrtable = {}
+		for k,v in pairs(self.stargate:GetAllGates()) do
+			local data = {
+				{
+				["Address"] = v:GetGateAddress(),
+				["Group"] = v:GetGateGroup(),
+				["Private"] = v:GetPrivate(),
+				["Local"] = v:GetLocale(),
+				["Class"] = v:GetClass(),
+				["Name"] = v:GetGateName(),
+				}
+			}
+			table.Add(addrtable,data)
 		end
+		net.Start("dc_AddressRequest"..self:EntIndex())
+			net.WriteTable(addrtable)
+		net.Send(ply)
 	end
 	function ENT:Think()
-		if not self.stargate.IsStargate then
-			self:GetCreator():ChatPrint("No Stargate found, Dialing Computer was removed.")
-			self:Remove()
-		end
-		if not IsValid(self.stargate) then return end
+		if not self.GetStargate then return end
+		if not IsValid(self.stargate) or self.stargate.IsStargate ~= true then return end
 		if self:GetGateOpen() ~= self.stargate.IsOpen then
 			self:SetGateOpen(self.stargate.IsOpen)
 		end
-		net.Receive("ComenceDial"..self:EntIndex(),function()
+		net.Receive("dc_ComenceDial"..self:EntIndex(),function()
 			self.stargate:DialGate(net.ReadString(),net.ReadBool())
 		end)
-		net.Receive("ChangeAddress"..self:EntIndex(),function()
+		net.Receive("dc_ChangeAddress"..self:EntIndex(),function()
+			if not self.SetDialingAddress then return end
 			self:SetDialingAddress(net.ReadString())
 		end)
+		net.Receive("dc_NewGate"..self:EntIndex(),function()
+			self:FindNewGate()
+		end)
+		net.Receive("dc_DisconnectGate"..self:EntIndex(),function()
+			if self:GetDialing() then
+				self.stargate:AbortDialling()
+			elseif self:GetGateOpen() then
+				self.stargate:Disconnect()
+			end
+		end)
+		net.Receive("dc_ToggleIris"..self:EntIndex(),function()
+			if not IsValid(self.stargate:GetIris()) then return end
+			self.stargate:GetIris():Toggle(true)
+		end)
+
+		if IsValid(self.stargate:GetIris()) and self:GetIrisClosed() ~= self.stargate:GetIris().IsActivated then
+			self:SetIrisClosed(self.stargate:GetIris().IsActivated)
+		end
 		if self:GetDialingSymbol() ~= self:GetStargate().DiallingSymbol then
-			if self:GetStargate():GetClass() == "stargate_atlantis" then return end
-			self:SetDialingSymbol(self:GetStargate().DiallingSymbol)
+			if not self:GetStargate():GetClass() == "stargate_atlantis" then
+				self:SetDialingSymbol(self:GetStargate().DiallingSymbol)
+			end
 		end
 		if self:GetRingSymbol() ~= self:GetStargate().RingSymbol then
-			self:SetRingSymbol(self:GetStargate().RingSymbol)
+			if not self:GetStargate():GetClass() == "stargate_atlantis" then
+				self:SetRingSymbol(self:GetStargate().RingSymbol)
+			end
 		end
 		if self:GetActive() ~= self.stargate.Active then
 			self:SetActive(self.stargate.Active)
 			if self:GetActive() == false then
-				net.Start("ClearAddress"..self:EntIndex())
+				if self:GetIrisClosed() then
+					self.stargate:GetIris():Toggle(true)
+				end
+				net.Start("dc_ClearAddress"..self:EntIndex())
 				net.Broadcast()
 			end
 		end
@@ -121,22 +216,44 @@ if SERVER then
 				end
 			//end
 		end
-		if self:GetDialing() ~= self.stargate.Dialling then
-			self:SetDialing(self.stargate.Dialling)
+
+		if self:GetDialing() ~= tobool(self.stargate.Dialling) then
+			self:SetDialing(tobool(self.stargate.Dialling))
+			if self:GetDialing() == true and not self:GetGateOpen() then
+				local address = table.concat(self.stargate.DialledAddress,"",1,#self.stargate.DialledAddress-1)
+				if address == "" then return end
+				net.Start("dc_AddHistory"..self:EntIndex())
+				net.WriteString(address)
+				net.Broadcast()
+			end
 		end
 		if not self:GetStargate().Dialling and self.locking then
 			self.locking = false
 			//self:SetDialingAddress("")
 		end
-		if self:GetInbound() ~= self.stargate:GetWire("Inbound",nil,true) then
+		if self:GetInbound() ~= tobool(self.stargate:GetWire("Inbound",nil,true)) then
 			self:SetInbound(tobool(self.stargate:GetWire("Inbound",nil,true)))
+			if self:GetInbound() and not self:GetIrisClosed() then
+				if not IsValid(self.stargate:GetIris()) then return end
+				self.stargate:GetIris():Toggle(true)
+			end
 		end
 	end
+
+	function ENT:OnRemove()
+		self.keyboard:Remove()
+		self.keyboard = nil
+	end
+
 end
 
 if CLIENT then
 	local detailcolor = Color(0,153,184)
 	local white = Color(255,255,255)
+	function ENT:GetRingAng()
+		return self:GetStargate():GetRingAng() or 0
+	end
+
 	function ENT:DetermineFont()
 		if self:GetStargate():GetClass() == "stargate_sg1" or self:GetStargate():GetClass() == "stargate_movie" then
 			self.font = "dc_glyphs_sg1"
@@ -145,15 +262,19 @@ if CLIENT then
 			self.font = "dc_glyphs_atl"
 			self.font2 = "dc_encodedglyph_atl"
 			self:GetStargate().GetRingAng = function(self) return 0 end
-		elseif self:GetStargate():GetClass() == "stargate_atlantis" then
+		elseif self:GetStargate():GetClass() == "stargate_universe" then
 			self.font = "stargate_address_glyphs_u"
 			self.font2 = "stargate_address_glyphs_u"
 		end
 	end
 
 	function ENT:Initialize()
-		self:DetermineFont()
-		self.stargate = self:GetStargate()
+		if self.GetStargate then
+			self.stargate = self:GetStargate()
+		end
+		if IsValid(self:GetStargate()) or self:GetStargate().IsStargate then
+			self:DetermineFont()
+		end
 		function draw.OutlinedBox(x,y,w,h,thick,col)
 			surface.SetDrawColor(col)
 			for i=0, thick - 1 do
@@ -185,6 +306,7 @@ if CLIENT then
 		self.chevronoff = Material("sgdialingcomp/gatechevronoff.png")
 		self.chevronon = Material("sgdialingcomp/gatechevronon.png")
 		self.eventhorizon = Material("sgdialingcomp/eventhorizon.png")
+		self.iristex = Material("sgdialingcomp/iris_alt.png")
 		self.csize = 0
 		self.lock = false
 		self.locking = false
@@ -195,6 +317,8 @@ if CLIENT then
 		self.lockchevoh = self.h/3.7
 		self.lcw = self.w/5
 		self.lch = self.h/3.7
+		self.addrtable = {}
+		self.dialhist = {}
 	end
 
 	function ENT:EncodeChevron()
@@ -246,6 +370,22 @@ if CLIENT then
 		self:DrawModel()
 		local w = 21*10
 		local h = 15.6*10
+		if not scripted_ents.Get("stargate_sg1") then
+			cam.Start3D2D( self:LocalToWorld(Vector(3.3,-10.5,24.5)), self:LocalToWorldAngles(Angle(0,90,90)), 0.1 )
+				draw.OutlinedBoxFilled(0,0,w,h,2,Color(0, 84, 255),Color(0, 84, 255))
+				draw.DrawText("CAP NOT INSTALLED","Trebuchet24",w/2,h/2.5,Color(255,255,255),TEXT_ALIGN_CENTER)
+				draw.DrawText("THIS ADDON REQUIRES CARTERS ADDON PACK","HudHintTextSmall",w/2,h/1.8,Color(255,255,255),TEXT_ALIGN_CENTER)
+			cam.End3D2D()
+			return
+		end
+		if not IsValid(self:GetStargate()) or self:GetStargate().IsStargate ~= true or not self.GetStargate then
+			cam.Start3D2D( self:LocalToWorld(Vector(3.3,-10.5,24.5)), self:LocalToWorldAngles(Angle(0,90,90)), 0.1 )
+				draw.OutlinedBoxFilled(0,0,w,h,2,detailcolor,Color(20,20,20))
+				draw.DrawText("NO GATE FOUND","Trebuchet24",w/2,h/2.5,Color(255,50,50),TEXT_ALIGN_CENTER)
+				draw.DrawText("PRESS ["..input.LookupBinding("+use"):upper().."] ON THE KEYBOARD TO FIND A GATE","HudHintTextSmall",w/2,h/1.8,Color(255,50,50),TEXT_ALIGN_CENTER)
+			cam.End3D2D()
+			return
+		end
 		local lockchevow = w/5
 		local lockchevoh = h/3.7
 		local daddress = self:GetDialingAddress()
@@ -297,6 +437,13 @@ if CLIENT then
 				surface.SetMaterial(self.eventhorizon)
 				surface.DrawTexturedRect(w/3.8,h/3.8,80,80)
 			end
+
+			if self:GetIrisClosed() then
+				surface.SetDrawColor(Color(255,255,255,self:GetGateOpen() and 70 or 255))
+				surface.SetMaterial(self.iristex)
+				surface.DrawTexturedRect(w/3.8,h/3.8,80,80)
+			end
+
 			if self:GetDialing() then
 				draw.DrawText("DIALING...","Trebuchet16",w/5,h/1.3,white,TEXT_ALIGN_LEFT)
 			end
@@ -313,7 +460,7 @@ if CLIENT then
 			draw.RoundedBox(0,w/5,h/1.36,5,5,detailcolor)
 			surface.SetMaterial(self.gateouter)
 			surface.DrawTexturedRect(w/3.8,h/3.8,80,80)
-			local ang = self:GetStargate():GetRingAng()
+			local ang = self:GetRingAng()
 			surface.SetDrawColor(white)
 			surface.SetMaterial(self.gatering)
 			surface.DrawTexturedRectRotatedPoint(w/2.2,h/1.92,80,80,ang+5,0,0)
@@ -339,12 +486,78 @@ if CLIENT then
 		cam.End3D2D()
 
 		//Locked Symbol
-		if self:GetDialingSymbol() == self:GetRingSymbol() and self:GetDialing() /*and not string.find(daddress,self:GetDialingSymbol())*/ then
+		if self:GetDialingSymbol() == self:GetRingSymbol() and self:GetDialing() and self:GetDialingSymbol() ~= "" then
 			cam.Start3D2D(self:LocalToWorld(Vector(3.3,-10.5,24.5)), self:LocalToWorldAngles(Angle(0,90,90)), self.csize)
 				draw.OutlinedBox(w/5,h/3.7,w/2,h/2,1,detailcolor)
 				draw.DrawText(self:GetDialingSymbol(),self.font2,w/2.2,h/2.5,white,TEXT_ALIGN_CENTER)
 			cam.End3D2D()
 		end
+	end
+
+	function ENT:OpenHistory()
+		local frame = vgui.Create("DFrame")
+		frame:SetSize(750,500)
+		frame:Center()
+		frame:MakePopup()
+		frame:SetTitle("")
+		frame.Paint = function(frame,w,h)
+			draw.OutlinedBoxFilled(0,0,w,h,3,detailcolor,Color(0,0,0))
+			draw.DrawText("Stargate Dialing Computer","Trebuchet24",150,20,white,TEXT_ALIGN_CENTER)
+			draw.DrawText(self:GetStargate():GetGateName(),"Trebuchet24",60,40,white,TEXT_ALIGN_LEFT)
+		end
+
+		self:CreateMenuBar(frame)
+
+		local clearbtn = vgui.Create("DButton",frame)
+		clearbtn:SetText("Clear History")
+		clearbtn:SetPos(60,62)
+		clearbtn:SetWide(80)
+
+		local addresslist = vgui.Create("DListView",frame)
+		addresslist:Dock(FILL)
+		addresslist:DockMargin(10,65,10,50)
+		addresslist.Paint = function(self,w,h)
+			draw.OutlinedBoxFilled(0,0,w,h,5,detailcolor,Color(0,0,0))
+		end
+		addresslist:AddColumn("Glyphs")
+		addresslist:AddColumn("Address")
+		addresslist:AddColumn("Inbound?")
+		addresslist.OnRowSelected = function(index)
+			if index == addresslist:GetSelectedLine() then return end
+			surface.PlaySound("buttons/button15.wav")
+		end
+		addresslist.RefreshItems = function(addresslist)
+			addresslist:Clear()
+			for k,v in pairs(self.dialhist) do
+				local addr = v["a"]
+				local inb = v["inb"]
+				local item = addresslist:AddLine(addr,addr,inb and "Yes" or "No")
+				item.address = addr
+				item.Columns[1]:SetTextColor(white)
+				item.Columns[2]:SetTextColor(white)
+				item.Columns[3]:SetTextColor(white)
+				item.Columns[1]:SetFont(self.font)
+			end
+		end
+
+		addresslist:RefreshItems()
+
+		addresslist.Think = function(addresslist)
+			if #addresslist:GetLines() ~= #self.dialhist then
+				addresslist:RefreshItems()
+			end
+		end
+
+		addresslist.DoDoubleClick = function(list,lineid,linepanel)
+			surface.PlaySound("buttons/button6.wav")
+			self:RequestDial(linepanel.address)
+		end
+
+		clearbtn.DoClick = function(btn)
+			table.Empty(self.dialhist)
+			addresslist:Clear()
+		end
+
 	end
 
 	function ENT:OpenGUI()
@@ -358,6 +571,9 @@ if CLIENT then
 			draw.DrawText("Stargate Dialing Computer","Trebuchet24",150,20,white,TEXT_ALIGN_CENTER)
 			draw.DrawText(self:GetStargate():GetGateName(),"Trebuchet24",60,40,white,TEXT_ALIGN_LEFT)
 		end
+
+		self:CreateMenuBar(frame,true)
+
 		local addresslist = vgui.Create("DListView",frame)
 		addresslist:Dock(FILL)
 		addresslist:DockMargin(10,100,10,50)
@@ -371,15 +587,16 @@ if CLIENT then
 			if index == addresslist:GetSelectedLine() then return end
 			surface.PlaySound("buttons/button15.wav")
 		end
-		for k,v in pairs(self:GetStargate():GetAllGates()) do
-			local address = v:GetGateAddress()
+		for k,v in pairs(self.addrtable) do
+			local address = v["Address"]
 			if address == self:GetStargate():GetGateAddress() then continue end
-			if v:GetClass() == "stargate_orlin" then continue end
-			if v:GetPrivate() then continue end
-			local group = v:GetGateGroup()
-			if v:GetLocale() and group ~= self:GetStargate():GetGateGroup() then continue end
+			if v["Class"] == "stargate_orlin" then continue end
+			if v["Private"] then continue end
+			local group = v["Group"]
+			local islocal = v["Local"]
+			if islocal and group ~= self:GetStargate():GetGateGroup() then continue end
 			if self:GetStargate():GetLocale() and group ~= self:GetStargate():GetGateGroup() then continue end
-			local name = v:GetGateName()
+			local name = v["Name"]
 			local item = addresslist:AddLine("")
 			item.stargate = v
 			//item.Columns[1]:SetFont(self.font)
@@ -404,7 +621,7 @@ if CLIENT then
 				if group ~= self:GetStargate():GetGateGroup() then
 					draw.DrawText("Left out symbols:","Trebuchet16",500,(h/2.4),white)
 					if self:GetStargate():GetClass() == "stargate_universe" then
-						if item.stargate:GetClass() == "stargate_universe" then
+						if item.stargate["Class"] == "stargate_universe" then
 							draw.DrawText(group[1],self.font,500,(h/1.7),white)
 						else
 							draw.DrawText(group,self.font,500,(h/1.7),white)
@@ -426,26 +643,14 @@ if CLIENT then
 			self:SetFast(newvalue)
 		end
 
-		//if self:GetStargate():GetClass() ~= "stargate_universe" then
-			local randomb = vgui.Create("DButton",frame)
-			randomb:SetPos(fastcheck:GetPos())
-			randomb:MoveBelow(fastcheck)
-			randomb:SetText("Dial Random Address")
-			randomb:SetWide(130)
-			randomb.DoClick = function(button)
-				self:RequestDial("*")
-				frame:Close()
-			end
-		//end
-
 		addresslist.DoDoubleClick = function(list,lineid,linepanel)
 			surface.PlaySound("buttons/button6.wav")
 			local requestedgate = linepanel.stargate
-			local address = requestedgate:GetGateAddress()
-			local group = requestedgate:GetGateGroup()
+			local address = requestedgate["Address"]
+			local group = requestedgate["Group"]
 			if group ~= self:GetStargate():GetGateGroup() then
 				if self:GetStargate():GetClass() == "stargate_universe" then
-					if requestedgate:GetClass() == "stargate_universe" then
+					if requestedgate["Class"] == "stargate_universe" then
 						address = address..group[1]
 					else
 						address = address..group
@@ -460,30 +665,56 @@ if CLIENT then
 				address = address.."#"
 			end
 			self:RequestDial(address)
-			frame:Close()
 		end
+	end
+
+	function ENT:CreateMenuBar(frame,isaddrlist,ply)
+		local mbar = vgui.Create("DMenuBar",frame)
+		mbar:DockMargin(-2,-26,31,0)
+		mbar:SetTall(20)
+		mbar.Paint = function(mbar,w,h)
+			draw.OutlinedBoxFilled(0,0,w,h,1,detailcolor,Color(0,0,0))
+		end
+
+		local gatem = mbar:AddMenu( "Gate" )
+		gatem:AddOption( "Re-link Computer", function() net.Start("dc_NewGate"..self:EntIndex()) net.SendToServer() end ):SetIcon( "icon16/link.png" )
+		gatem:AddOption( "Dial Random Gate", function() self:RequestDial("*") end ):SetIcon( "icon16/transmit.png" )
+		gatem:AddOption("Disconnect Gate", function() net.Start("dc_DisconnectGate"..self:EntIndex()) net.SendToServer() end):SetIcon("icon16/disconnect.png")
+
+		local irism = mbar:AddMenu("Iris")
+		irism:AddOption("Toggle",function() net.Start("dc_ToggleIris"..self:EntIndex()) net.SendToServer() end):SetIcon("icon16/shield.png")
+
+		local cmenu = mbar:AddMenu("Computer")
+		if not isaddrlist then
+			cmenu:AddOption("Address List",function() self:OpenGUI() frame:Close() end):SetIcon("icon16/application_view_detail.png")
+		else
+			cmenu:AddOption("Dial History",function() self:OpenHistory() frame:Close() end):SetIcon("icon16/application_view_detail.png")
+		end
+
+		cmenu:AddOption("Settings",function() Derma_Message("Settings Menu isn't implemented yet","Sorry","OK") end):SetIcon("icon16/cog.png")
+
 	end
 
 	function ENT:RequestDial(address)
 		if address == "*" then
-			local gates = self:GetStargate():GetAllGates()
+			local gates = table.Copy(self.addrtable)
 			for k,v in pairs(gates) do
-				if v:GetLocale() and v:GetGateGroup() ~= self:GetStargate():GetGateGroup() then
+				if v["Local"] and v["Group"] ~= self:GetStargate():GetGateGroup() then
 					table.RemoveByValue(gates,v)
 				end
-				if self:GetStargate():GetLocale() and v:GetGateGroup() ~= self:GetStargate():GetGateGroup() then
+				if self:GetStargate():GetLocale() and v["Group"] ~= self:GetStargate():GetGateGroup() then
 					table.RemoveByValue(gates,v)
 				end
-				if v:GetGateAddress() == self:GetStargate():GetGateAddress() then
+				if v["Address"] == self:GetStargate():GetGateAddress() then
 					table.RemoveByValue(gates,v)
 				end
 			end
 			local randgate = table.Random(gates)
-			address = randgate:GetGateAddress()
-			local group = randgate:GetGateGroup()
+			address = randgate["Address"]
+			local group = randgate["Group"]
 			if group ~= self:GetStargate():GetGateGroup() then
 				if self:GetStargate():GetClass() == "stargate_universe" then
-					if randgate:GetClass() == "stargate_universe" then
+					if randgate["Class"] == "stargate_universe" then
 						address = address
 					else
 						address = address..group
@@ -498,30 +729,32 @@ if CLIENT then
 				address = address.."#"
 			end
 		end
-		net.Start("ComenceDial"..self:EntIndex())
+		net.Start("dc_ComenceDial"..self:EntIndex())
 		net.WriteString(address)
 		net.WriteBool(self:GetFast())
 		net.SendToServer()
 	end
 
 	function ENT:Think()
-		net.Receive("AddressRequest"..self:EntIndex(),function(len,ply)
+		net.Receive("dc_AddressRequest"..self:EntIndex(),function(len,ply)
 			/*Derma_StringRequest("Dialing Computer","Input Dial Address","",function(txt)
-				net.Start("ComenceDial"..self:EntIndex())
+				net.Start("dc_ComenceDial"..self:EntIndex())
 				net.WriteString(string.upper(txt).."#")
 				net.SendToServer(ply)
 			end,nil,"Dial")*/
+			self.addrtable = net.ReadTable()
 			self:OpenGUI()
 		end)
-		if not IsValid(self:GetStargate()) then return end
+		if not IsValid(self:GetStargate()) or self:GetStargate().IsStargate ~= true then return end
 		local daddress = self:GetStargate():GetDialledAddress()
 		if daddress ~= self:GetDialingAddress() then
 			if self:GetKeyboardActive() then return end
-			net.Start("ChangeAddress"..self:EntIndex())
+			if not IsValid(self:GetStargate()) or self:GetStargate().IsStargate ~= true then return end
+			net.Start("dc_ChangeAddress"..self:EntIndex())
 			net.WriteString(daddress)
 			net.SendToServer()
 		end
-		if self.stargate ~= self:GetStargate() then
+		if IsValid(self.stargate) and self.stargate ~= self:GetStargate() then
 			self.stargate = self:GetStargate()
 			self:DetermineFont()
 		end
@@ -534,9 +767,19 @@ if CLIENT then
 		if string.find(self:GetDialingAddress(),self.lastsymbol) and self.locking then
 			self:LockChevron()
 		end
-		net.Receive("ClearAddress"..self:EntIndex(),function()
+		net.Receive("dc_ClearAddress"..self:EntIndex(),function()
+			if not self.GetStargate then return end
+			if not IsValid(self:GetStargate()) or self:GetStargate().IsStargate ~= true then return end
 			self:GetStargate():SetNetworkedString("DialledAddress","")
 			self:SetDialingAddress("")
+		end)
+		net.Receive("dc_AddHistory"..self:EntIndex(),function()
+			if not self.GetStargate then return end
+			if not IsValid(self:GetStargate()) or self:GetStargate().IsStargate ~= true then return end
+			local addr = net.ReadString()
+			timer.Simple(1,function()
+				table.insert(self.dialhist,{["a"] = addr, ["inb"] = self:GetInbound()})
+			end)
 		end)
 
 	end
